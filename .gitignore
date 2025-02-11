@@ -1,0 +1,19 @@
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore temporary and backup files
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.bak
+
+# Ignore virtual environment (if using)
+venv/
+.env/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+*.json
+*.bpe

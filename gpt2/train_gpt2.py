@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers import GPT2Tokenizer
 
 
 class Block(nn.Module):
@@ -30,6 +31,7 @@ class CausalAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
         # causal mask to prevent attending to future tokens
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
@@ -57,6 +59,7 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -87,6 +90,23 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing between wte and lm_head
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         B, T = idx.size() # batch size, sequence length
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -100,7 +120,11 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x) # shape (B, T, n_embd)
         logits = self.lm_head(x) # shape (B, T, vocab_size)
-        return logits
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            return logits, loss
+        else:
+            return logits
         
 
     @classmethod
@@ -151,36 +175,107 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open("input.txt", "r") as f:
+            text = f.read()
+
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokens = tokenizer.encode(text)    
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
+
+        # state
+        self.current_position = 0
+
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        if self.current_position + B*T + 1 > len(self.tokens):
+            self.current_position = 0
+
+        buf = torch.tensor(self.tokens[self.current_position:self.current_position + B*T + 1])
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B*T
+        return x, y
 
 if __name__ == "__main__":
 
-    from transformers import GPT2Tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    # model=GPT.from_pretrained("gpt2")
-    # print("did not crash!!!")
+    # Model Inference
+    if torch.cuda.is_available():
+        device = "cuda"
+    # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    #     device = "mps"
+    else:
+        device = "cpu"
+    print(f"using device: {device}")
 
-    num_return_sequences = 5
-    max_length = 30
+    # from transformers import GPT2Tokenizer
+    # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
-    model = GPT.from_pretrained("gpt2")
-    model.eval()
-    model.to("cpu")
+    # with open("input.txt", "r") as f:
+    #     text = f.read()
+    # data = text[:1000]
+    # tokens = tokenizer.encode(data)
+    # B, T = 4, 32
+    # buf = torch.tensor(tokens[:B*T + 1])
+    # x = buf[:-1].view(B, T)
+    # y = buf[1:].view(B, T)
+    # print(x.shape, y.shape)
 
 
-    prompt = "Hello, I'm a language model,"
-    tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long)
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+    
+    model = GPT(GPTConfig())
+    model.to(device)
+    B, T = 4, 32
+    num_steps = 10
+    dataloader = DataLoaderLite(B=B, T=T)
 
-    with torch.no_grad():
-        sample_tokens = tokens.repeat(num_return_sequences, 1)
-        for _ in range(max_length):
-            logits = model(sample_tokens)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            top_probs, top_indices = torch.topk(probs, k=100, dim=-1)
-            sampled_indices = torch.multinomial(top_probs, num_samples=1)  
-            next_token_indices = torch.gather(top_indices, dim=1, index=sampled_indices)
-            sample_tokens = torch.cat([sample_tokens, next_token_indices], 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    
+    for i in range(num_steps):
+        x, y = dataloader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()        
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {i}, loss: {loss.item()}")
 
-        for sample_token in sample_tokens:
-            print(tokenizer.decode(sample_token))
-            print("-"*40)
+    print(torch.all(model.state_dict()["lm_head.weight"]==model.state_dict()["transformer.wte.weight"]))
+
+    # num_return_sequences = 5
+    # max_length = 30
+
+    # # model = GPT.from_pretrained("gpt2")
+    # model = GPT(GPTConfig())
+    # model.eval()
+    # model.to(device)
+
+
+    # prompt = "Hello, I'm a language model,"
+    # tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long).to(device)
+
+    # with torch.no_grad():
+    #     sample_tokens = tokens.repeat(num_return_sequences, 1)
+    #     for _ in range(max_length):
+    #         logits = model(sample_tokens)
+    #         logits = logits[:, -1, :]
+    #         probs = F.softmax(logits, dim=-1)
+    #         top_probs, top_indices = torch.topk(probs, k=100, dim=-1)
+    #         sampled_indices = torch.multinomial(top_probs, num_samples=1)  
+    #         next_token_indices = torch.gather(top_indices, dim=1, index=sampled_indices)
+    #         sample_tokens = torch.cat([sample_tokens, next_token_indices], 1)
+
+    #     for sample_token in sample_tokens:
+    #         print(tokenizer.decode(sample_token))
+    #         print("-"*40)

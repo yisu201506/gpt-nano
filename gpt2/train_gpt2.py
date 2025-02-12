@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2Tokenizer
+import time
 
 
 class Block(nn.Module):
@@ -236,22 +237,35 @@ if __name__ == "__main__":
     
     model = GPT(GPTConfig())
     model.to(device)
-    B, T = 4, 32
-    num_steps = 10
+
+    # use torch.compile for better training time, it uses graph optimization and fusion, and not eager execution
+    # 340ms -> 140ms, 48000 tokens/s -> 115000 tokens/s, you may not access python interpreter any more
+    model = torch.compile(model)
+    B, T = 16, 1024
+    num_steps = 50
     dataloader = DataLoaderLite(B=B, T=T)
 
+    # use tfloat32 for better training time improvement on A100, 1000ms -> 380ms, 15700 tokens/s -> 42000 tokens/s
+    torch.set_float32_matmul_precision('high') 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     
     for i in range(num_steps):
+        t0 = time.time()
         x, y = dataloader.next_batch()
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()        
-        logits, loss = model(x, y)
+        optimizer.zero_grad()
+
+        # use bfloat16 for better training time, 380ms -> 330ms, 42000 tokens/s -> 48000 tokens/s
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):  
+            logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"step {i}, loss: {loss.item()}")
+        torch.cuda.synchronize() # wait for all the GPToperations to finish
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_second = dataloader.B * dataloader.T / (t1 - t0)
+        print(f"step {i}, loss: {loss.item()}, time: {dt:.2f}ms, tokens/s: {tokens_per_second:.2f}")
 
-    print(torch.all(model.state_dict()["lm_head.weight"]==model.state_dict()["transformer.wte.weight"]))
 
     # num_return_sequences = 5
     # max_length = 30

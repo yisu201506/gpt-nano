@@ -46,10 +46,17 @@ class CausalAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        wei = q @ k.transpose(-2, -1) * (1.0 / (k.size(-1) ** 0.5)) # (B, nh, T, T)
-        wei = wei.masked_fill(self.bias[:, :, :T, :T]==0, float("-inf"))
-        wei = F.softmax(wei, dim=-1)
-        out = wei @ v
+        # wei = q @ k.transpose(-2, -1) * (1.0 / (k.size(-1) ** 0.5)) # (B, nh, T, T)
+        # wei = wei.masked_fill(self.bias[:, :, :T, :T]==0, float("-inf"))
+        # wei = F.softmax(wei, dim=-1)
+        # out = wei @ v
+
+        ###### Performance Optimization 4 ######
+        # use flash attention to speed up the attention operation. More FLOPs, but it happens in all in SM
+        # instead of having to transmit back to the GPU memory.
+        # 140ms -> 98ms, 116500 tokens/s -> 167000 tokens/s
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         out = out.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         return self.c_proj(out)
 
@@ -217,37 +224,29 @@ if __name__ == "__main__":
         device = "cpu"
     print(f"using device: {device}")
 
-    # from transformers import GPT2Tokenizer
-    # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-    # with open("input.txt", "r") as f:
-    #     text = f.read()
-    # data = text[:1000]
-    # tokens = tokenizer.encode(data)
-    # B, T = 4, 32
-    # buf = torch.tensor(tokens[:B*T + 1])
-    # x = buf[:-1].view(B, T)
-    # y = buf[1:].view(B, T)
-    # print(x.shape, y.shape)
-
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
     
-    model = GPT(GPTConfig())
+    ###### Performance Optimization 5 ######
+    # use a number which is a large power of 2 times a small number, 50304 = 2^7 * 393
+    # 98ms -> 95ms, 167000 tokens/s -> 171000 tokens/s
+    model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
 
+    ###### Performance Optimization 3 ######
     # use torch.compile for better training time, it uses graph optimization and fusion, and not eager execution
-    # 340ms -> 140ms, 48000 tokens/s -> 115000 tokens/s, you may not access python interpreter any more
+    # 338ms -> 140ms, 48400 tokens/s -> 116500 tokens/s, you may not access python interpreter any more
     model = torch.compile(model)
     B, T = 16, 1024
     num_steps = 50
     dataloader = DataLoaderLite(B=B, T=T)
 
-    # use tfloat32 for better training time improvement on A100, 1000ms -> 380ms, 15700 tokens/s -> 42000 tokens/s
+    ###### Performance Optimization 1 ######
+    # use tfloat32 for better training time improvement on A100, 1040ms -> 383ms, 15700 tokens/s -> 42700 tokens/s
     torch.set_float32_matmul_precision('high') 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     
     for i in range(num_steps):
         t0 = time.time()
@@ -255,7 +254,9 @@ if __name__ == "__main__":
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
 
-        # use bfloat16 for better training time, 380ms -> 330ms, 42000 tokens/s -> 48000 tokens/s
+
+        ###### Performance Optimization 2 ######
+        # use bfloat16 for better training time, 383ms -> 338ms, 42700 tokens/s -> 48400 tokens/s
         with torch.autocast(device_type=device, dtype=torch.bfloat16):  
             logits, loss = model(x, y)
         loss.backward()
@@ -265,31 +266,3 @@ if __name__ == "__main__":
         dt = (t1 - t0) * 1000
         tokens_per_second = dataloader.B * dataloader.T / (t1 - t0)
         print(f"step {i}, loss: {loss.item()}, time: {dt:.2f}ms, tokens/s: {tokens_per_second:.2f}")
-
-
-    # num_return_sequences = 5
-    # max_length = 30
-
-    # # model = GPT.from_pretrained("gpt2")
-    # model = GPT(GPTConfig())
-    # model.eval()
-    # model.to(device)
-
-
-    # prompt = "Hello, I'm a language model,"
-    # tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long).to(device)
-
-    # with torch.no_grad():
-    #     sample_tokens = tokens.repeat(num_return_sequences, 1)
-    #     for _ in range(max_length):
-    #         logits = model(sample_tokens)
-    #         logits = logits[:, -1, :]
-    #         probs = F.softmax(logits, dim=-1)
-    #         top_probs, top_indices = torch.topk(probs, k=100, dim=-1)
-    #         sampled_indices = torch.multinomial(top_probs, num_samples=1)  
-    #         next_token_indices = torch.gather(top_indices, dim=1, index=sampled_indices)
-    #         sample_tokens = torch.cat([sample_tokens, next_token_indices], 1)
-
-    #     for sample_token in sample_tokens:
-    #         print(tokenizer.decode(sample_token))
-    #         print("-"*40)

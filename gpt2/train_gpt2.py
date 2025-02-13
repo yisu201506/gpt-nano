@@ -287,27 +287,40 @@ if __name__ == "__main__":
     num_steps = 50
     dataloader = DataLoaderLite(B=B, T=T)
 
+    total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+    B = 64 # micro batch size
+    T = 1024 # sequence length
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")    
+
     ###### Performance Optimization 1 ######
     # use tfloat32 for better training time improvement on A100, 1040ms -> 383ms, 15700 tokens/s -> 42700 tokens/s
     torch.set_float32_matmul_precision('high') 
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
     ###### Performance Optimization 6 ######
+    # 95ms -> 92ms, 171000 tokens/s -> 178000 tokens/s
     # use AdamW optimizer with weight decay and fused version if available.
     # Weight decay is a regularization technique that helps prevent overfitting by penalizing large weights.
-    # 95ms -> 92ms, 171000 tokens/s -> 178000 tokens/s
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
     
     for i in range(num_steps):
         t0 = time.time()
-        x, y = dataloader.next_batch()
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        ###### Performance Optimization 2 ######
-        # use bfloat16 for better training time, 383ms -> 338ms, 42700 tokens/s -> 48400 tokens/s
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):  
-            logits, loss = model(x, y)
-        loss.backward()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+
+            x, y = dataloader.next_batch()
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            ###### Performance Optimization 2 ######
+            # use bfloat16 for better training time, 383ms -> 338ms, 42700 tokens/s -> 48400 tokens/s
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):  
+                logits, loss = model(x, y)
+            loss.backward()
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
@@ -316,6 +329,6 @@ if __name__ == "__main__":
         torch.cuda.synchronize() # wait for all the GPToperations to finish
         t1 = time.time()
         dt = t1 - t0
-        token_processed = dataloader.B * dataloader.T
+        token_processed = dataloader.B * dataloader.T * grad_accum_steps
         tokens_per_second = token_processed/ dt
-        print(f"step {i:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.5f} | time: {dt * 1000:.2f}ms | tokens/s: {tokens_per_second:.2f}")
+        print(f"step {i:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.5f} | time: {dt * 1000:.2f}ms | tokens/s: {tokens_per_second:.2f}")

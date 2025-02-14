@@ -206,12 +206,14 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device == "cuda"
-        print(f"using fused AdamW: {use_fused}")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer            
     
@@ -227,8 +229,8 @@ class DataLoaderLite:
 
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         self.tokens = tokenizer.encode(text)    
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
+        # print(f"loaded {len(self.tokens)} tokens")
+        # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
 
         # state
         self.current_position = self.B * self.T * self.process_rank
@@ -322,7 +324,7 @@ if __name__ == "__main__":
     dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size)
 
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-    B = 64 # micro batch size
+    B = 16 # micro batch size
     T = 1024 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -351,14 +353,14 @@ if __name__ == "__main__":
             x, y = dataloader.next_batch()
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             ###### Performance Optimization 2 ######
             # use bfloat16 for better training time, 383ms -> 338ms, 42700 tokens/s -> 48400 tokens/s
             with torch.autocast(device_type=device, dtype=torch.bfloat16):  
                 logits, loss = model(x, y)
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            if ddp:
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
 
         if ddp:

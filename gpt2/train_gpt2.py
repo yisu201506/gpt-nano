@@ -11,7 +11,7 @@ import inspect
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-
+import numpy as np
 
 class Block(nn.Module):
 
@@ -217,24 +217,48 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer            
     
+def load_tokens(file_path):
+    np_tokens = np.load(file_path)
+    tokens = torch.tensor(np_tokens, dtype=torch.long)
+    return tokens
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in ['train', 'val']
 
-        with open("input.txt", "r") as f:
-            text = f.read()
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
 
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        self.tokens = tokenizer.encode(text)    
-        # print(f"loaded {len(self.tokens)} tokens")
-        # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
+        # get the shard filename
+
+        # with open("input.txt", "r") as f:
+        #     text = f.read()
+
+        # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        # self.tokens = tokenizer.encode(text)    
+        # # print(f"loaded {len(self.tokens)} tokens")
+        # # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
 
         # state
-        self.current_position = self.B * self.T * self.process_rank
+        self.reset()
 
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -242,15 +266,18 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
         self.current_position += B * T * self.num_processes
+        # if loading next batch is out of bound, advance to the next shard
         if self.current_position + B * T * self.num_processes + 1 > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank        
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank        
         return x, y
 
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -319,18 +346,19 @@ if __name__ == "__main__":
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    B, T = 16, 1024
-    num_steps = 50
-    dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size)
+
 
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-    B = 16 # micro batch size
+    B = 64 # micro batch size
     T = 1024 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size, split='train')
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size, split='val')        
 
     print("I am GPU", ddp_local_rank)
 
@@ -344,13 +372,73 @@ if __name__ == "__main__":
     # use AdamW optimizer with weight decay and fused version if available.
     # Weight decay is a regularization technique that helps prevent overfitting by penalizing large weights.
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
-    
-    for i in range(num_steps):
+    enc = GPT2Tokenizer.from_pretrained("gpt2")
+
+    for i in range(max_steps):
         t0 = time.time()
+        # once in a while evaluate our validation loss
+        step = i
+        if step % 100 == 0:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
+
+        # once in a while generate from the model (except step 0, which is noise)
+        if (step > 0 and step % 100 == 0) and False:
+            model.eval()
+            num_return_sequences = 4
+            max_length = 32
+            tokens = enc.encode("Hello, I'm a language model,")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42 + ddp_rank)
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(xgen) # (B, T, vocab_size)
+                    # take the logits at the last position
+                    logits = logits[:, -1, :] # (B, vocab_size)
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    # do top-k sampling of 50 (huggingface pipeline default)
+                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                    # select a token from the top-k probabilities
+                    # note: multinomial does not demand the input to sum to 1
+                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                    # gather the corresponding indices
+                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                    # append to the sequence
+                    xgen = torch.cat((xgen, xcol), dim=1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+        # train loop
+        model.train()
+        optimizer.zero_grad()
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
 
-            x, y = dataloader.next_batch()
+            x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             if ddp:

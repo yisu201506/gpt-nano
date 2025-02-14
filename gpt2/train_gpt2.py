@@ -231,33 +231,33 @@ class DataLoaderLite:
         self.num_processes = num_processes
         assert split in ['train', 'val']
 
-        # get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
-            print(f"found {len(shards)} shards for split {split}")
+        # # get the shard filenames
+        # data_root = "edu_fineweb10B"
+        # shards = os.listdir(data_root)
+        # shards = [s for s in shards if split in s]
+        # shards = sorted(shards)
+        # shards = [os.path.join(data_root, s) for s in shards]
+        # self.shards = shards
+        # assert len(shards) > 0, f"no shards found for split {split}"
+        # if master_process:
+        #     print(f"found {len(shards)} shards for split {split}")
 
         # get the shard filename
 
-        # with open("input.txt", "r") as f:
-        #     text = f.read()
+        with open("input.txt", "r") as f:
+            text = f.read()
 
-        # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        # self.tokens = tokenizer.encode(text)    
-        # # print(f"loaded {len(self.tokens)} tokens")
-        # # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokens = torch.tensor(tokenizer.encode(text))    
+        # print(f"loaded {len(self.tokens)} tokens")
+        # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
 
         # state
         self.reset()
 
     def reset(self):
         self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        # self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
@@ -268,8 +268,8 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         # if loading next batch is out of bound, advance to the next shard
         if self.current_position + B * T * self.num_processes + 1 > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            # self.current_shard = (self.current_shard + 1) % len(self.shards)
+            # self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank        
         return x, y
 
@@ -406,11 +406,12 @@ if __name__ == "__main__":
 
     for i in range(max_steps):
         t0 = time.time()
-        # once in a while evaluate our validation loss
-
+        
         step = i
         last_step = (i == max_steps - 1)
-        if step % 250 == 0 and last_step:
+        
+        # once in a while evaluate our validation loss
+        if step % 250 == 0 or last_step:
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -428,40 +429,52 @@ if __name__ == "__main__":
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
                 with open(log_file, "a") as f:
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")                
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    # you might also want to add optimizer.state_dict() and
+                    # rng seeds etc., if you wanted to more exactly resume training
+                    torch.save(checkpoint, checkpoint_path)                               
 
-    # # once in a while evaluate hellaswag
-    # if (step % 250 == 0 or last_step) and (not use_compile):
-    #     num_correct_norm = 0
-    #     num_total = 0
-    #     for i, example in enumerate(iterate_examples("val")):
-    #         # only process examples where i % ddp_world_size == ddp_rank
-    #         if i % ddp_world_size != ddp_rank:
-    #             continue
-    #         # render the example into tokens and labels
-    #         _, tokens, mask, label = render_example(example)
-    #         tokens = tokens.to(device)
-    #         mask = mask.to(device)
-    #         # get the logits
-    #         with torch.no_grad():
-    #             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-    #                 logits, loss = model(tokens)
-    #             pred_norm = get_most_likely_row(tokens, mask, logits)
-    #         num_total += 1
-    #         num_correct_norm += int(pred_norm == label)
-    #     # reduce the stats across all processes
-    #     if ddp:
-    #         num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-    #         num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-    #         dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-    #         dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-    #         num_total = num_total.item()
-    #         num_correct_norm = num_correct_norm.item()
-    #     acc_norm = num_correct_norm / num_total
-    #     if master_process:
-    #         print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-    #         with open(log_file, "a") as f:
-    #             f.write(f"{step} hella {acc_norm:.4f}\n")
+        # once in a while evaluate hellaswag
+        if (step % 5 == 0 or last_step) and (not use_compile):
+            num_correct_norm = 0
+            num_total = 0
+            for i, example in enumerate(iterate_examples("val")):
+                # only process examples where i % ddp_world_size == ddp_rank
+                if i % ddp_world_size != ddp_rank:
+                    continue
+                # render the example into tokens and labels
+                _, tokens, mask, label = render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                # get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(tokens)
+                    pred_norm = get_most_likely_row(tokens, mask, logits)
+                num_total += 1
+                num_correct_norm += int(pred_norm == label)
+            # reduce the stats across all processes
+            if ddp:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct_norm = num_correct_norm.item()
+            acc_norm = num_correct_norm / num_total
+            if master_process:
+                print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} hella {acc_norm:.4f}\n")
 
 
         # once in a while generate from the model (except step 0, which is noise)

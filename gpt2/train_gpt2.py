@@ -231,24 +231,24 @@ class DataLoaderLite:
         self.num_processes = num_processes
         assert split in ['train', 'val']
 
-        # # get the shard filenames
-        # data_root = "edu_fineweb10B"
-        # shards = os.listdir(data_root)
-        # shards = [s for s in shards if split in s]
-        # shards = sorted(shards)
-        # shards = [os.path.join(data_root, s) for s in shards]
-        # self.shards = shards
-        # assert len(shards) > 0, f"no shards found for split {split}"
-        # if master_process:
-        #     print(f"found {len(shards)} shards for split {split}")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
 
         # get the shard filename
 
-        with open("input.txt", "r") as f:
-            text = f.read()
+        # with open("input.txt", "r") as f:
+        #     text = f.read()
 
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        self.tokens = torch.tensor(tokenizer.encode(text))    
+        # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        # self.tokens = torch.tensor(tokenizer.encode(text))    
         # print(f"loaded {len(self.tokens)} tokens")
         # print(f"1 epoch has {len(self.tokens) // (B*T)} batches")
 
@@ -257,7 +257,7 @@ class DataLoaderLite:
 
     def reset(self):
         self.current_shard = 0
-        # self.tokens = load_tokens(self.shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
@@ -372,7 +372,7 @@ if __name__ == "__main__":
 
 
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-    B = 16 # micro batch size
+    B = 64 # micro batch size
     T = 1024 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -444,7 +444,7 @@ if __name__ == "__main__":
                     torch.save(checkpoint, checkpoint_path)                               
 
         # once in a while evaluate hellaswag
-        if (step % 5 == 0 or last_step) and (not use_compile):
+        if (step % 250 == 0 or last_step) and (not use_compile):
             num_correct_norm = 0
             num_total = 0
             for i, example in enumerate(iterate_examples("val")):
